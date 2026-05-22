@@ -1,0 +1,220 @@
+#################################################################################################################
+Dataset Balancing Code
+#################################################################################################################
+import os
+import shutil
+import math
+from tqdm import tqdm
+import tensorflow as tf
+import numpy as np
+import cv2
+import pandas as pd # Ensure pandas is imported as it's used in the logic
+
+# --- BEGIN ADDED CODE TO ADDRESS NAMEOCCUR ---
+
+# From cell 0LE-ZGs1gotQ: load_data function definition
+def load_data():
+    # Assuming train_csv, test_csv, valid_csv are defined globally from cell 75PMwjDtDM-g
+    train = pd.read_csv(train_csv, encoding='utf-8')
+    test = pd.read_csv(test_csv, encoding='utf-8')
+    valid = pd.read_csv(valid_csv)
+
+    # Assuming train_img, test_img, validation_img are defined globally from cell 75PMwjDtDM-g
+    train_dir = train_img
+    test_dir = test_img
+    valid_dir = validation_img
+
+    # construct file paths directly within function:
+    train['image_path'] = train_dir + train['id_code'] + '.png'
+    test['image_path'] = test_dir + test['id_code'] + '.png'
+    valid['image_path'] = valid_dir + valid['id_code'] + '.png'
+
+    train['train_images'] = train['id_code'] + '.png'
+    test['test_images'] = test['id_code'] + '.png'
+    valid['valid_images'] = valid['id_code'] + '.png'
+
+    train['diagnosis'] = train['diagnosis'].astype(str)
+    test['diagnosis'] = test['diagnosis'].astype(str)
+    valid['diagnosis'] = valid['diagnosis'].astype(str)
+
+    return train, test, valid
+
+# From cell MjxQMylNjg7S: calling load_data to define dataframes
+train_df, test_df, valid_df = load_data()
+
+# From cell A0BXofBqK9cx: constants definition
+NUM_CLASSES = 5
+BATCH_SIZE = 32
+IMG_SIZE = (224, 224)
+epochs = 20
+
+# --- END ADDED CODE TO ADDRESS NAMEOCCUR ---
+
+
+# Define the new base directory for the balanced dataset in Google Drive
+balanced_base_dir = '/content/drive/MyDrive/balanced_aptos2019'
+
+# Ensure the main balanced directory exists
+os.makedirs(balanced_base_dir, exist_ok=True)
+
+# Define splits using the already loaded dataframes
+splits = {
+    "train": train_df,
+    "valid": valid_df,
+    "test": test_df
+}
+
+# Function to load and preprocess a single image for augmentation
+def load_image_for_augmentation(image_path, target_size=IMG_SIZE):
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"Warning: Could not read image at {image_path}")
+        return None
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, target_size)
+    img_tensor = tf.convert_to_tensor(img, dtype=tf.float32)
+    img_tensor = tf.expand_dims(img_tensor, axis=0) # Add batch dimension
+    return img_tensor
+
+# Function to balance and save images for a given split
+def balance_and_save_split(df, split_name, base_output_dir, num_classes=NUM_CLASSES, img_augmentation_model=None):
+    print(f"\n--- Balancing and saving {split_name} split ---")
+
+    # Create split-specific output directory
+    split_output_dir = os.path.join(base_output_dir, split_name)
+    os.makedirs(split_output_dir, exist_ok=True)
+
+    # Get class counts
+    class_counts = df['diagnosis'].value_counts().sort_index()
+    print(f"Original {split_name} class counts:\n{class_counts}")
+
+    # Determine the target count (maximum count)
+    target_count = class_counts.max()
+    print(f"Target count per class for {split_name}: {target_count}")
+
+    # List to store information about new augmented images for creating a new DataFrame later
+    augmented_image_data = []
+
+    # Iterate through each class
+    for i in range(num_classes):
+        class_label = str(i)
+        class_output_dir = os.path.join(split_output_dir, class_label)
+        os.makedirs(class_output_dir, exist_ok=True)
+
+        class_df = df[df['diagnosis'] == class_label]
+        current_class_count = len(class_df)
+
+        print(f"Class {class_label}: Current count = {current_class_count}, Target count = {target_count}")
+
+        # Copy original images and collect their paths for the new dataframe
+        for idx, row in tqdm(class_df.iterrows(), total=current_class_count, desc=f"Copying original {split_name} class {class_label} images"):
+            src_path = row['image_path']
+            filename = os.path.basename(src_path)
+            dst_path = os.path.join(class_output_dir, filename)
+            if os.path.exists(src_path):
+                shutil.copy(src_path, dst_path)
+                # Add original image info to augmented_image_data list
+                augmented_image_data.append({'id_code': row['id_code'], 'diagnosis': class_label, 'image_path': dst_path})
+            else:
+                print(f"Warning: Original image {src_path} not found.")
+
+        # Augment images if needed
+        needed_augmentations = target_count - current_class_count
+        if needed_augmentations > 0 and img_augmentation_model is not None:
+            print(f"Augmenting {needed_augmentations} images for {split_name} class {class_label}...")
+
+            # Select images to augment (cycle through existing images)
+            images_to_augment_paths = class_df['image_path'].tolist()
+            if not images_to_augment_paths:
+                print(f"Warning: No images to augment from for {split_name} class {class_label}.")
+                continue
+
+            augmentation_idx = 0
+            for k in tqdm(range(needed_augmentations), desc=f"Generating augmented {split_name} class {class_label} images"):
+                original_img_path = images_to_augment_paths[augmentation_idx % len(images_to_augment_paths)]
+                img_tensor = load_image_for_augmentation(original_img_path)
+
+                if img_tensor is not None:
+                    # Apply augmentation
+                    augmented_img_tensor = img_augmentation_model(img_tensor, training=True)
+                    augmented_img = augmented_img_tensor.numpy()[0]
+
+                    # Convert back to uint8 for saving
+                    augmented_img = np.clip(augmented_img, 0, 255).astype(np.uint8)
+
+                    # Generate unique filename for augmented image
+                    original_filename_base = os.path.splitext(os.path.basename(original_img_path))[0]
+                    augmented_filename = f"{original_filename_base}_aug_{k:04d}.png"
+                    dst_path = os.path.join(class_output_dir, augmented_filename)
+
+                    # Save the augmented image
+                    cv2.imwrite(dst_path, cv2.cvtColor(augmented_img, cv2.COLOR_RGB2BGR))
+                    augmented_image_data.append({'id_code': f'{original_filename_base}_aug_{k:04d}', 'diagnosis': class_label, 'image_path': dst_path})
+                augmentation_idx += 1
+        elif img_augmentation_model is None and needed_augmentations > 0:
+            print(f"Warning: img_augmentation_model is None, cannot augment for {split_name} class {class_label}.")
+
+    print(f"{split_name} split balancing complete.")
+    # Return a new DataFrame with paths to all images (original + augmented) for this split
+    return pd.DataFrame(augmented_image_data)
+
+
+# Process each split
+balanced_dataframes = {}
+for split_name, df in splits.items():
+    # Ensure 'img_augmentation' is accessible (it's defined in a prior cell)
+    if 'img_augmentation' in locals() or 'img_augmentation' in globals():
+        balanced_dataframes[split_name] = balance_and_save_split(df, split_name, balanced_base_dir, img_augmentation_model=img_augmentation)
+    else:
+        print("Error: 'img_augmentation' model not found. Please ensure it's defined in a preceding cell.")
+        break
+
+print("\nAll datasets balanced and saved!")
+
+# Optional: Display the new balanced class counts if dataframes were generated successfully
+for split_name, balanced_df in balanced_dataframes.items():
+    if not balanced_df.empty:
+        print(f"\nBalanced {split_name} class counts:\n{balanced_df['diagnosis'].value_counts().sort_index()}")
+    else:
+        print(f"\nNo balanced dataframe generated for {split_name}.")
+
+###############################################################################################################################################################################
+###############################################################################################################################################################################
+train_0 = train_df[train_df['diagnosis']== '0'][['id_code','diagnosis']]
+train_1 = train_df[train_df['diagnosis']== '1'][['id_code','diagnosis']]
+train_2 = train_df[train_df['diagnosis']== '2'][['id_code','diagnosis']]
+train_3 = train_df[train_df['diagnosis']== '3'][['id_code','diagnosis']]
+train_4 = train_df[train_df['diagnosis']== '4'][['id_code','diagnosis']]
+
+train_0.to_csv('/content/drive/MyDrive/aptos2019_organised/train/train_0.csv', index=False)
+train_1.to_csv('/content/drive/MyDrive/aptos2019_organised/train/train_1.csv', index=False)
+train_2.to_csv('/content/drive/MyDrive/aptos2019_organised/train/train_2.csv', index=False)
+train_3.to_csv('/content/drive/MyDrive/aptos2019_organised/train/train_3.csv', index=False)
+train_4.to_csv('/content/drive/MyDrive/aptos2019_organised/train/train_4.csv', index=False)
+
+val_0 = valid_df[valid_df['diagnosis'] == '0'][['id_code','diagnosis']]
+val_1 = valid_df[valid_df['diagnosis'] == '1'][['id_code','diagnosis']]
+val_2 = valid_df[valid_df['diagnosis'] == '2'][['id_code','diagnosis']]
+val_3 = valid_df[valid_df['diagnosis'] == '3'][['id_code','diagnosis']]
+val_4 = valid_df[valid_df['diagnosis'] == '4'][['id_code','diagnosis']]
+
+val_0.to_csv('/content/drive/MyDrive/aptos2019_organised/val/val_0.csv', index=False)
+val_1.to_csv('/content/drive/MyDrive/aptos2019_organised/val/val_1.csv', index=False)
+val_2.to_csv('/content/drive/MyDrive/aptos2019_organised/val/val_2.csv', index=False)
+val_3.to_csv('/content/drive/MyDrive/aptos2019_organised/val/val_3.csv', index=False)
+val_4.to_csv('/content/drive/MyDrive/aptos2019_organised/val/val_4.csv', index=False)
+
+test_0 = test_df[test_df['diagnosis'] == '0'][['id_code', 'diagnosis']]
+test_1 = test_df[test_df['diagnosis'] == '1'][['id_code', 'diagnosis']]
+test_2 = test_df[test_df['diagnosis'] == '2'][['id_code', 'diagnosis']]
+test_3 = test_df[test_df['diagnosis'] == '3'][['id_code', 'diagnosis']]
+test_4 = test_df[test_df['diagnosis'] == '4'][['id_code', 'diagnosis']]
+
+test_0.to_csv('/content/drive/MyDrive/aptos2019_organised/test/test_0.csv', index=False)
+test_1.to_csv('/content/drive/MyDrive/aptos2019_organised/test/test_1.csv', index=False)
+test_2.to_csv('/content/drive/MyDrive/aptos2019_organised/test/test_2.csv', index=False)
+test_3.to_csv('/content/drive/MyDrive/aptos2019_organised/test/test_3.csv', index=False)
+test_4.to_csv('/content/drive/MyDrive/aptos2019_organised/test/test_4.csv', index=False)
+
+############################################################################################################################################################################################
+############################################################################################################################################################################################
